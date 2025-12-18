@@ -1,14 +1,3 @@
-# seq2seq_lstm_rag_fixed.py
-# Updated single-file RAG prototype + Seq2Seq LSTM baseline (padding fixes + robustness)
-# Key fixes:
-# - Ensure tokenizer pad/bos/eos exist BEFORE constructing LSTM embeddings
-# - Use len(tokenizer) for vocab_size so padding_idx < vocab_size
-# - Lazy-load huge transformer only if requested
-# - Use torch.optim.AdamW with lower LR
-# - Sanitize repeated punctuation
-# - Sampling (temp + top-k) decoding to avoid collapse
-# - Clear GPU cache before training LSTM if transformer was loaded
-
 !pip install pypdf python-docx numpy faiss-cpu sentence-transformers
 !pip install transformers accelerate torch
 !pip install bitsandbytes
@@ -168,7 +157,7 @@ def load_transformer_llm():
         device_map='auto',
         torch_dtype=torch.float16
     )
-    # If tokenizer changed and model embeddings need resizing, we'd handle it here. For Mistral it's typically fine.
+    
     return model, tokenizer
 
 def generate_answer_transformer(model, tokenizer, query: str, context: str, max_tokens: int = 150):
@@ -204,7 +193,6 @@ class LuongAttention(nn.Module):
 class Seq2SeqLSTM(nn.Module):
     def __init__(self, vocab_size, emb_dim=256, hid_dim=512, n_layers=2, pad_idx=0):
         super().__init__()
-        # vocab_size and pad_idx must be consistent: 0 <= pad_idx < vocab_size
         self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=emb_dim, padding_idx=pad_idx)
         self.encoder = nn.LSTM(emb_dim, hid_dim, n_layers, batch_first=True)
         self.decoder = nn.LSTM(emb_dim, hid_dim, n_layers, batch_first=True)
@@ -288,10 +276,6 @@ def collate_fn(batch, pad_idx=0, max_src_len=256, max_trg_len=128):
 
 def train_seq2seq(model: Seq2SeqLSTM, tokenizer, chunks: List[str], device='cpu',
                    epochs=3, batch_size=8, lr=1e-4):
-    """
-    Train seq2seq LSTM. Uses AdamW with a smaller LR and gradient clipping.
-    Important: ensure tokenizer has pad token before calling this function.
-    """
     model.to(device)
     dataset = ChunkPairDataset(tokenizer, chunks)
     if len(dataset) == 0:
@@ -411,27 +395,23 @@ def ensure_lstm(tokenizer, device='cpu'):
     Build LSTM model AFTER ensuring tokenizer special tokens exist and vocab size is known.
     """
     if CACHE['lstm_model'] is None:
-        # Ensure tokenizer has pad token and special tokens
         changed = ensure_special_tokens(tokenizer)
-        # Recompute vocab size *after* any token additions
         vocab_size = len(tokenizer)
         pad_idx = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        # sanity check: pad_idx must be within [0, vocab_size)
-        if not (0 <= pad_idx < vocab_size):
-            # fix by mapping pad token string to id (re-add if necessary)
+        
+        if not (0 <= pad_idx < vocab_size):  
             if tokenizer.pad_token is None:
                 tokenizer.add_special_tokens({'pad_token': '[PAD]'})
             pad_idx = tokenizer.pad_token_id
             vocab_size = len(tokenizer)
             if not (0 <= pad_idx < vocab_size):
-                # final fallback
                 pad_idx = 0
         lstm = Seq2SeqLSTM(vocab_size=vocab_size, emb_dim=256, hid_dim=512, n_layers=2, pad_idx=pad_idx)
         CACHE['lstm_model'] = lstm
         CACHE['lstm_tokenizer'] = tokenizer
     return CACHE['lstm_model']
 
-# Main QA function used by Gradio
+
 def qa_interface(file, query, model_choice='Transformer', train_lstm=False, lstm_epochs=2):
     try:
         file_path = file.name
@@ -457,20 +437,15 @@ def qa_interface(file, query, model_choice='Transformer', train_lstm=False, lstm
             latency = time.time() - start
             mode = 'Transformer'
         else:
-            # Seq2Seq LSTM
-            # Get tokenizer (try cache first; if absent, load transformer tokenizer - note: large)
             if CACHE.get('transformer_tokenizer') is None:
-                # load tokenizer (and model) lazily; acceptable for prototype
                 _, tokenizer = ensure_transformer()
             else:
                 tokenizer = CACHE['transformer_tokenizer']
 
-            # ensure special tokens exist before building LSTM
             ensure_special_tokens(tokenizer)
             lstm_model = ensure_lstm(tokenizer)
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-            # If transformer model exists on GPU, free it to avoid OOM
             if train_lstm and CACHE.get('transformer_model') is not None:
                 try:
                     del CACHE['transformer_model']
